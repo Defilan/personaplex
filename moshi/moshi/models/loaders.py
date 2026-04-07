@@ -32,7 +32,7 @@ import torch
 logger = logging.getLogger(__name__)
 
 from .compression import MimiModel
-from .lm import LMModel
+from .lm import LMModel, MultiGPULMModel
 from ..modules import SEANetEncoder, SEANetDecoder, transformer
 from ..quantization import SplitResidualVectorQuantizer
 
@@ -340,25 +340,59 @@ def _get_moshi_lm_with_offload(
         model.eval()
         return model
 
-    # Infer device map based on available GPU memory
+    num_gpus = torch.cuda.device_count()
+    if num_gpus > 1:
+        return _get_moshi_lm_multi_gpu(model, num_gpus, dtype)
+
+    # Single GPU: use accelerate for CPU offloading
     device_map = infer_auto_device_map(
         model,
-        max_memory=None,  # Let accelerate auto-detect available memory
+        max_memory=None,
         no_split_module_classes=["StreamingTransformerLayer"],
         dtype=dtype,
     )
-
-    # Log the device distribution
-    gpu_layers = sum(1 for v in device_map.values() if v == 0 or v == "cuda:0")
-    cpu_layers = sum(1 for v in device_map.values() if v == "cpu")
-    logger.info(f"Device map: {gpu_layers} modules on GPU, {cpu_layers} modules on CPU")
-
-    # Dispatch model across devices
-    model = dispatch_model(
-        model,
-        device_map=device_map,
-        offload_dir="offload_weights",  # Directory for disk offload if needed
-    )
-
+    model = dispatch_model(model, device_map=device_map, offload_dir="offload_weights")
     model.eval()
     return model
+
+
+def _get_moshi_lm_multi_gpu(model: LMModel, num_gpus: int, dtype: torch.dtype) -> MultiGPULMModel:
+    """Distribute model across multiple GPUs with manual placement."""
+    primary = torch.device("cuda:0")
+    last_gpu = torch.device(f"cuda:{num_gpus - 1}")
+
+    # Embeddings on primary GPU
+    model.emb.to(primary)
+    model.text_emb.to(primary)
+
+    # Distribute transformer layers across GPUs
+    layers = list(model.transformer.layers)
+    num_layers = len(layers)
+    layers_per_gpu = (num_layers + num_gpus - 1) // num_gpus
+    for i, layer in enumerate(layers):
+        gpu_idx = min(i // layers_per_gpu, num_gpus - 1)
+        layer.to(torch.device(f"cuda:{gpu_idx}"))
+
+    # Output norm and text head on last GPU
+    if model.out_norm is not None:
+        model.out_norm.to(last_gpu)
+    model.text_linear.to(last_gpu)
+
+    # Depformer and output heads on last GPU
+    model.depformer.to(last_gpu)
+    model.depformer_in.to(last_gpu)
+    model.depformer_emb.to(last_gpu)
+    model.depformer_text_emb.to(last_gpu)
+    model.linears.to(last_gpu)
+    if hasattr(model, 'gating'):
+        model.gating.to(last_gpu)
+
+    gpu_mem = {}
+    for i in range(num_gpus):
+        free, total = torch.cuda.mem_get_info(i)
+        used = (total - free) / 1024**3
+        gpu_mem[i] = f"{used:.1f}GB"
+    logger.info(f"Multi-GPU placement: {gpu_mem} used, {layers_per_gpu} layers/GPU")
+
+    model.eval()
+    return MultiGPULMModel(model, primary, last_gpu)

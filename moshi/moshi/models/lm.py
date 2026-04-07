@@ -552,6 +552,45 @@ class LMModel(StreamingContainer):
         return LMOutput(logits, logits_mask, text_logits, text_logits_mask)
 
 
+class MultiGPULMModel:
+    """Wraps LMModel to handle tensor transfers between GPUs during inference."""
+
+    def __init__(self, model: LMModel, primary_device: torch.device, depformer_device: torch.device):
+        self._model = model
+        self.primary_device = primary_device
+        self.depformer_device = depformer_device
+
+    @property
+    def device(self):
+        return self.primary_device
+
+    def parameters(self):
+        return self._model.parameters()
+
+    def eval(self):
+        self._model.eval()
+        return self
+
+    def forward_codes(self, sequence: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        sequence = sequence.to(self.primary_device)
+        return self._model.forward_codes(sequence)
+
+    def forward_embeddings(self, input: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        input = input.to(self.primary_device)
+        return self._model.forward_embeddings(input)
+
+    def forward_depformer(self, depformer_cb_index: int, sequence: torch.Tensor,
+                          transformer_out: torch.Tensor) -> torch.Tensor:
+        sequence = sequence.to(self.depformer_device)
+        transformer_out = transformer_out.to(self.depformer_device)
+        return self._model.forward_depformer(depformer_cb_index, sequence, transformer_out)
+
+    def __getattr__(self, name):
+        if name in ('_model', 'primary_device', 'depformer_device'):
+            raise AttributeError(name)
+        return getattr(self._model, name)
+
+
 @dataclass
 class _LMGenState:
     cache: torch.Tensor
@@ -702,6 +741,11 @@ class LMGen(StreamingModule[_LMGenState]):
     def _init_streaming_state(self, batch_size: int) -> _LMGenState:
         lm_model = self.lm_model
         initial = lm_model._get_initial_token()
+
+        # Detect multi-device (accelerate dispatch_model spreads layers across GPUs)
+        devices = {p.device for p in lm_model.parameters()}
+        multi_device = len(devices) > 1
+
         cache = torch.full(
             (batch_size, self.lm_model.num_codebooks, self.max_delay + 3),
             lm_model.ungenerated_token_id,
@@ -715,8 +759,8 @@ class LMGen(StreamingModule[_LMGenState]):
             dtype=torch.bool
         )
 
-        disable = lm_model.device.type != 'cuda'
-        # disable = True # DEBUG
+        # CUDA graphs can't capture cross-device transfers
+        disable = lm_model.device.type != 'cuda' or multi_device
         graphed_main = CUDAGraphed(lm_model.forward_codes, disable=disable)
         graphed_embeddings = CUDAGraphed(lm_model.forward_embeddings, disable=disable)
         graphed_depth = CUDAGraphed(self.depformer_step, disable=disable)
@@ -889,12 +933,26 @@ class LMGen(StreamingModule[_LMGenState]):
         assert sampled_text_token.shape[1] == 1, "Only one text stream supported."
         sampled_text_token = sampled_text_token[:, 0, 0]  # shape is [B]
 
+        # Transformer output may be on a different GPU than the cache
+        sampled_text_token = sampled_text_token.to(state.cache.device)
         next_text_token = torch.where(provided_[:, 0, 0], target_[:, 0, 0], sampled_text_token)
 
+        # Transfer depformer inputs to depformer device when using multi-GPU
+        dep_device = getattr(lm_model, 'depformer_device', lm_model.device)
+        dep_transformer_out = transformer_out.to(dep_device, non_blocking=True)
+        dep_target = target_[:, lm_model.audio_offset:, 0].to(dep_device, non_blocking=True)
+        dep_provided = provided_[:, lm_model.audio_offset:, 0].to(dep_device, non_blocking=True)
+        dep_text_token = next_text_token.to(dep_device, non_blocking=True)
+
         if self.return_logits:
-            sampled_audio_tokens, audio_logits = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0]) # [B, K_audio, Card_audio]
+            sampled_audio_tokens, audio_logits = state.graphed_depth(dep_text_token, dep_transformer_out, dep_target, dep_provided)
         else:
-            sampled_audio_tokens = state.graphed_depth(next_text_token, transformer_out, target_[:,lm_model.audio_offset:,0], provided_[:,lm_model.audio_offset:,0])
+            sampled_audio_tokens = state.graphed_depth(dep_text_token, dep_transformer_out, dep_target, dep_provided)
+
+        # Transfer results back to primary device for cache storage
+        sampled_audio_tokens = sampled_audio_tokens.to(lm_model.device, non_blocking=True)
+        if self.return_logits:
+            audio_logits = audio_logits.to(lm_model.device, non_blocking=True)
 
         state.provided[:, :, model_input_position] = False
         ####

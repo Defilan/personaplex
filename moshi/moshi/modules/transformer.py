@@ -713,6 +713,10 @@ class StreamingTransformer(StreamingModule[_TransformerState]):
             x = x + self.positional_scale * pos_emb
 
         for layer in self.layers:
+            # Move input to layer's device for multi-GPU
+            layer_device = next(layer.parameters()).device
+            if x.device != layer_device:
+                x = x.to(layer_device)
             x = layer(x, *args, **kwargs)
 
         if state is not None:
